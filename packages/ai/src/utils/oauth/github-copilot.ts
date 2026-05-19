@@ -144,95 +144,56 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 	};
 }
 
-/**
- * Sleep that can be interrupted by an AbortSignal
- */
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Login cancelled"));
-			return;
-		}
-
-		const timeout = setTimeout(resolve, ms);
-
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new Error("Login cancelled"));
-			},
-			{ once: true },
-		);
-	});
-}
-
-async function pollForGitHubAccessToken(
-	domain: string,
-	deviceCode: string,
-	intervalSeconds: number,
-	expiresIn: number,
-	signal?: AbortSignal,
-) {
+async function pollForGitHubAccessToken(domain: string, device: DeviceCodeResponse, signal?: AbortSignal) {
 	const urls = getUrls(domain);
-	const deadline = Date.now() + expiresIn * 1000;
-	let intervalMs = Math.max(1000, Math.floor(intervalSeconds * 1000));
-	let intervalMultiplier = INITIAL_POLL_INTERVAL_MULTIPLIER;
-	let slowDownResponses = 0;
-
-	while (Date.now() < deadline) {
-		if (signal?.aborted) {
-			throw new Error("Login cancelled");
-		}
-
-		const remainingMs = deadline - Date.now();
-		const waitMs = Math.min(Math.ceil(intervalMs * intervalMultiplier), remainingMs);
-		await abortableSleep(waitMs, signal);
-
-		const raw = await fetchJson(urls.accessTokenUrl, {
-			method: "POST",
-			headers: {
-				Accept: "application/json",
-				"Content-Type": "application/x-www-form-urlencoded",
-				"User-Agent": "GitHubCopilotChat/0.35.0",
-			},
-			body: new URLSearchParams({
-				client_id: CLIENT_ID,
-				device_code: deviceCode,
-				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-			}),
-		});
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
-			return (raw as DeviceTokenSuccessResponse).access_token;
-		}
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-			const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
-			if (error === "authorization_pending") {
-				continue;
-			}
-
-			if (error === "slow_down") {
-				slowDownResponses += 1;
-				intervalMs =
-					typeof interval === "number" && interval > 0 ? interval * 1000 : Math.max(1000, intervalMs + 5000);
-				intervalMultiplier = SLOW_DOWN_POLL_INTERVAL_MULTIPLIER;
-				continue;
-			}
-
-			const descriptionSuffix = description ? `: ${description}` : "";
-			throw new Error(`Device flow failed: ${error}${descriptionSuffix}`);
-		}
-	}
-
-	if (slowDownResponses > 0) {
-		throw new Error(
+	return pollOAuthDeviceCodeFlow<string>({
+		authorization: {
+			userCode: device.user_code,
+			verificationUri: device.verification_uri,
+			intervalSeconds: device.interval,
+			expiresInSeconds: device.expires_in,
+		},
+		signal,
+		initialIntervalMultiplier: INITIAL_POLL_INTERVAL_MULTIPLIER,
+		slowDownIntervalMultiplier: SLOW_DOWN_POLL_INTERVAL_MULTIPLIER,
+		slowDownTimeoutMessage:
 			"Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again.",
-		);
-	}
+		poll: async () => {
+			const raw = await fetchJson(urls.accessTokenUrl, {
+				method: "POST",
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": "GitHubCopilotChat/0.35.0",
+				},
+				body: new URLSearchParams({
+					client_id: CLIENT_ID,
+					device_code: device.device_code,
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+				}),
+			});
 
-	throw new Error("Device flow timed out");
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
+				return { status: "complete", value: (raw as DeviceTokenSuccessResponse).access_token };
+			}
+
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
+				const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
+				if (error === "authorization_pending") {
+					return { status: "pending" };
+				}
+
+				if (error === "slow_down") {
+					return { status: "slow_down", intervalSeconds: interval };
+				}
+
+				const descriptionSuffix = description ? `: ${description}` : "";
+				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
+			}
+
+			return { status: "failed", message: "Invalid device token response" };
+		},
+	});
 }
 
 /**
@@ -361,13 +322,7 @@ export async function loginGitHubCopilot(options: {
 		options.onAuth(device.verification_uri, `Enter code: ${device.user_code}`);
 	}
 
-	const githubAccessToken = await pollForGitHubAccessToken(
-		domain,
-		device.device_code,
-		device.interval,
-		device.expires_in,
-		options.signal,
-	);
+	const githubAccessToken = await pollForGitHubAccessToken(domain, device, options.signal);
 	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
 
 	// Enable all models after successful login
