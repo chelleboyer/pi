@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added first-run interactive theme detection from the terminal background.
 - Added containerization documentation and a Gondolin extension example for routing built-in tools into a local micro-VM.
 - Added Ant Ling provider selection and setup documentation.
 - Added NVIDIA NIM provider selection, setup documentation, and direct NIM request attribution headers.

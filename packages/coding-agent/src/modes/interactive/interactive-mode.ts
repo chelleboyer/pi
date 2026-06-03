@@ -123,17 +123,21 @@ import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import {
+	detectTerminalBackground,
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
+	getThemeForRgbColor,
 	initTheme,
 	onThemeChange,
+	parseOsc11BackgroundColor,
 	setRegisteredThemes,
 	setTheme,
 	setThemeInstance,
 	stopThemeWatcher,
+	type TerminalThemeDetection,
 	Theme,
 	type ThemeColor,
 	theme,
@@ -186,6 +190,57 @@ function isDeadTerminalError(error: unknown): boolean {
 
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+
+function queryTerminalBackground(tui: TUI, timeoutMs = 200): Promise<TerminalThemeDetection | undefined> {
+	return new Promise((resolve) => {
+		let settled = false;
+		let cleanupTimer: NodeJS.Timeout | undefined;
+		let resolveTimer: NodeJS.Timeout | undefined;
+		let unsubscribe: (() => void) | undefined;
+
+		const cleanup = () => {
+			if (unsubscribe) {
+				unsubscribe();
+				unsubscribe = undefined;
+			}
+			if (cleanupTimer) {
+				clearTimeout(cleanupTimer);
+				cleanupTimer = undefined;
+			}
+			if (resolveTimer) {
+				clearTimeout(resolveTimer);
+				resolveTimer = undefined;
+			}
+		};
+
+		const finish = (detection: TerminalThemeDetection | undefined) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			resolve(detection);
+		};
+
+		unsubscribe = tui.addInputListener((data) => {
+			const rgb = parseOsc11BackgroundColor(data);
+			if (!rgb) {
+				return undefined;
+			}
+			finish({
+				theme: getThemeForRgbColor(rgb),
+				source: "terminal background",
+				detail: `OSC 11 background rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`,
+				confidence: "high",
+			});
+			return { consume: true };
+		});
+
+		resolveTimer = setTimeout(() => finish(undefined), timeoutMs);
+		cleanupTimer = setTimeout(cleanup, 2000);
+		tui.terminal.write("\x1b]11;?\x07");
+	});
+}
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -421,6 +476,26 @@ export class InteractiveMode {
 		initTheme(this.settingsManager.getTheme(), true);
 	}
 
+	private async detectAndPersistFirstRunTheme(): Promise<void> {
+		if (this.settingsManager.getTheme()) {
+			return;
+		}
+
+		const detection = (await queryTerminalBackground(this.ui)) ?? detectTerminalBackground();
+		const result = setTheme(detection.theme, true);
+		if (!result.success) {
+			return;
+		}
+
+		if (detection.confidence === "high") {
+			this.settingsManager.setTheme(detection.theme);
+			await this.settingsManager.flush();
+		}
+		this.ui.invalidate();
+		this.updateEditorBorderColor();
+		this.ui.requestRender();
+	}
+
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
 		if (!sourceInfo) {
 			return undefined;
@@ -617,8 +692,27 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// Add header container as first child
+		// Add header container as first child. Populate it after first-run theme detection.
 		this.ui.addChild(this.headerContainer);
+
+		this.ui.addChild(this.chatContainer);
+		this.ui.addChild(this.pendingMessagesContainer);
+		this.ui.addChild(this.statusContainer);
+		this.renderWidgets(); // Initialize with default spacer
+		this.ui.addChild(this.widgetContainerAbove);
+		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.widgetContainerBelow);
+		this.ui.addChild(this.footer);
+		this.ui.setFocus(this.editor);
+
+		this.setupKeyHandlers();
+		this.setupEditorSubmitHandler();
+
+		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		this.ui.start();
+		this.isInitialized = true;
+
+		await this.detectAndPersistFirstRunTheme();
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
@@ -680,23 +774,7 @@ export class InteractiveMode {
 			this.builtInHeader = new Text("", 0, 0);
 			this.headerContainer.addChild(this.builtInHeader);
 		}
-
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
-		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
-		this.ui.setFocus(this.editor);
-
-		this.setupKeyHandlers();
-		this.setupEditorSubmitHandler();
-
-		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
-		this.ui.start();
-		this.isInitialized = true;
+		this.ui.requestRender();
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
